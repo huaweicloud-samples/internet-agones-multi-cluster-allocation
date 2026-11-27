@@ -1,0 +1,247 @@
+# OpenTelemetry Collector — receives OTLP from Fluent Bit (logs) and scrapes
+# Prometheus metrics (cluster/Agones), then exports:
+#   * metrics -> AOM  (Application Operations Management)
+#   * logs    -> LTS  (Log Tank Service)
+# Adapted from the 云 sample's otel.yaml (which used the 云 Container Insights
+# receiver + awsemf exporter). The Huawei Cloud OTel collector obtains temporary
+# credentials from the CCE agency attached to the cluster's nodes (the IRSA
+# equivalent), so no AK/SK is embedded here.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: ${namespace}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "endpoints"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/proxy", "nodes/stats", "configmaps", "events"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: ${namespace}
+roleRef:
+  kind: ClusterRole
+  name: otel-collector-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-agent-conf
+  namespace: ${namespace}
+  labels:
+    app: opentelemetry
+    component: otel-agent-conf
+data:
+  otel-agent-config: |
+    extensions:
+      health_check:
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # Scrape cluster + Agones Prometheus metrics (equivalent to 云
+      # containerinsights receiver + prometheus receiver).
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'otel-collector'
+              scrape_interval: 60s
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                  action: keep
+                  regex: true
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                  action: replace
+                  target_label: __metrics_path__
+                  regex: (.+)
+                - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                  action: replace
+                  regex: ([^:]+)(?::\d+)?;(\d+)
+                  replacement: $$1:$$2
+                  target_label: __address__
+                - source_labels: [__meta_kubernetes_namespace]
+                  action: replace
+                  target_label: Namespace
+                - source_labels: [__meta_kubernetes_pod_node_name]
+                  action: replace
+                  target_label: NodeName
+                - source_labels: [__meta_kubernetes_pod_name]
+                  action: replace
+                  target_label: PodName
+                - source_labels: [__address__]
+                  action: replace
+                  target_label: ClusterName
+                  replacement: "${cluster_name}"
+                - source_labels: [__meta_kubernetes_pod_container_name]
+                  action: replace
+                  target_label: Service
+
+    processors:
+      resource:
+        attributes:
+        - key: Sources
+          action: delete
+        - key: kubernetes
+          action: delete
+        # Replace gameserver pod names to a common name (avoids metric explosion).
+        - key: PodName
+          action: extract
+          pattern: "(?P<PodName>dgs-fleet).*"
+        - key: PodName
+          action: extract
+          pattern: "(?P<Service>dgs-fleet).*"
+        - key: AutoScalingGroupName
+          action: extract
+          pattern: "(?P<NodeGroupName>.*?)-[0-9]{6,}.*"
+
+      # Drop high-volume/noise metrics (equivalent to 云 filter/exclude).
+      filter/exclude:
+        metrics:
+          exclude:
+            match_type: regexp
+            metric_names:
+              - container_.*
+              - go_.*
+              - redis_.*
+              - process_.*
+
+      batch/metrics:
+        timeout: 60s
+      batch/logs:
+        timeout: 5s
+
+    exporters:
+      # AOM OTLP ingestion endpoint. Authentication is handled automatically by
+      # the Huawei Cloud OTel collector using the CCE agency temp credentials.
+      otlphttp/aom:
+        endpoint: https://aom.${region}.myhuaweicloud.com/v3/${project_id}/otlp/v1/metrics
+
+      # LTS OTLP ingestion endpoint (logs). Same agency-based auth.
+      otlphttp/lts:
+        endpoint: https://lts.${region}.myhuaweicloud.com/v3/${project_id}/lts/otlp/v1/logs
+        headers:
+          # LTS requires the target log group/stream; carried as headers.
+          x-log-group-id: "${lts_group_id}"
+          x-log-stream-id: "${lts_stream_id}"
+
+    service:
+      pipelines:
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [filter/exclude, resource, batch/metrics]
+          exporters: [otlphttp/aom]
+        logs:
+          receivers: [otlp]
+          processors: [batch/logs]
+          exporters: [otlphttp/lts]
+      extensions: [health_check]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: ${namespace}
+  labels:
+    app: opentelemetry
+    component: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opentelemetry
+      component: otel-collector
+  template:
+    metadata:
+      labels:
+        app: opentelemetry
+        component: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          # Huawei Cloud OTel collector (AOM/LTS aware, agency-auth). Synced to
+          # SWR by src/mirror/sync-images.sh. The public `hwcce` org is
+          # unavailable in this account, so it is mirrored into the `agones` org
+          # (see infra/swr_repos.tf).
+          image: swr.cn-north-4.myhuaweicloud.com/agones/opentelemetry-collector:0.102.0
+          args: ["--config=/conf/otel-agent-config.yaml"]
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            limits:
+              cpu: 200m
+              memory: 400Mi
+            requests:
+              cpu: 200m
+              memory: 200Mi
+          volumeMounts:
+            - name: otel-config-vol
+              mountPath: /conf
+      volumes:
+        - name: otel-config-vol
+          configMap:
+            name: otel-agent-conf
+            items:
+              - key: otel-agent-config
+                path: otel-agent-config.yaml
+      serviceAccountName: otel-collector
+      tolerations:
+      - operator: "Exists"
+        effect: "NoExecute"
+      - operator: "Exists"
+        effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: ${namespace}
+  labels:
+    app: opentelemetry
+    component: otel-collector
+spec:
+  selector:
+    app: opentelemetry
+    component: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      protocol: TCP
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      protocol: TCP
+      targetPort: 4318

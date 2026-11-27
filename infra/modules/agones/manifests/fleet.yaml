@@ -1,0 +1,44 @@
+# https://agones.dev/site/docs/reference/fleet/
+apiVersion: "agones.dev/v1"
+kind: Fleet
+metadata:
+  name: dgs-fleet
+spec:
+  scheduling: Packed
+  template:
+    spec:
+      container: dgs
+      ports:
+      - name: default
+        containerPort: 7654
+        protocol: TCPUDP
+      template:
+        spec:
+          containers:
+          - name: dgs
+            # Image is synced to SWR by src/mirror/sync-images.sh (no public NAT).
+            image: ${gameserver_image}
+            args: ["7654", "true"]
+            env:
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+          tolerations:
+          - key: "gameserver"
+            operator: "Exists"
+            effect: "NoExecute"
+---
+# https://agones.dev/site/docs/reference/fleetautoscaler/
+apiVersion: "autoscaling.agones.dev/v1"
+kind: FleetAutoscaler
+metadata:
+  name: dgs-autoscaler
+spec:
+  fleetName: dgs-fleet
+  policy:
+    type: Buffer
+    buffer:
+      bufferSize: 25%
+      minReplicas: 5
+      maxReplicas: 100
